@@ -1,18 +1,14 @@
-import 'dart:async';
-import 'dart:io';
 import 'dart:math';
 
-// The commercial module exposes the PayPal billing surface (webhook route,
-// gateway factory, reconciliation job) under `src/` only; they are
-// module-internal services, not part of its public API.
-// ignore: implementation_imports
-import 'package:gewerber_backend_commercial_server/src/modules/subscription/payments/payment_gateway.dart';
-// ignore: implementation_imports
-import 'package:gewerber_backend_commercial_server/src/modules/subscription/payments/paypal_gateway_factory.dart';
-// ignore: implementation_imports
-import 'package:gewerber_backend_commercial_server/src/modules/subscription/payments/paypal_webhook_route.dart';
-// ignore: implementation_imports
-import 'package:gewerber_backend_commercial_server/src/modules/subscription/services/paypal_reconciliation_job.dart';
+// The commercial module's public barrel. Prefixed because the barrel
+// re-exports module-level names (e.g. the generated `Protocol`/`Endpoints`
+// classes) that collide with the host's. The generated
+// `ServerpodFutureCallsGetter` extension is hidden because its name collides
+// with the host-generated extension of the same name (affects
+// `pod.futureCalls`); the host's copy must win.
+import 'package:gewerber_backend_commercial_server/gewerber_backend_commercial_server.dart'
+    as commercial
+    hide ServerpodFutureCallsGetter;
 import 'package:serverpod/serverpod.dart';
 import 'package:serverpod_auth_idp_server/core.dart';
 import 'package:serverpod_auth_idp_server/providers/email.dart';
@@ -82,10 +78,12 @@ void run(List<String> args) async {
     ],
   );
 
-  // PayPal billing wiring (commercial deployments only; a complete no-op in
-  // the OSS default configuration). Runs before `pod.start()` because the
-  // Relic-based web server binds its routes when it starts.
-  await _wirePayPalBilling(pod);
+  // Commercial billing wiring (PayPal webhook route + hourly reconciliation
+  // sweep), provided by the closed-source module's public entrypoint. A
+  // complete no-op in the OSS default configuration (and with the public
+  // stubs, which ship an identical no-op). Runs before `pod.start()`
+  // because the Relic-based web server binds its routes when it starts.
+  await commercial.wireCommercialBilling(pod);
 
   // Start the server.
   await pod.start();
@@ -117,90 +115,4 @@ String _generateVerificationCode() {
       (_) => digits.codeUnitAt(random.nextInt(digits.length)),
     ),
   );
-}
-
-/// How often the PayPal reconciliation sweep runs (safety net for lost or
-/// never-delivered webhooks). Matches the hourly cadence of the invoicing
-/// future calls.
-const Duration _paypalReconciliationInterval = Duration(hours: 1);
-
-/// Mounts the commercial PayPal webhook route and schedules the
-/// reconciliation sweep.
-///
-/// Bit-identical no-op in the OSS default configuration: gated by the same
-/// [commercialEntitlementsEnabled] flag as the `EntitlementProvider` DI swap
-/// (see `src/core/di/injection.dart`), so self-hosted deployments without the
-/// commercial env var never mount a route or start a timer. When the flag is
-/// on but `PAYPAL_CLIENT_ID` / `PAYPAL_CLIENT_SECRET` are unset
-/// ([PayPalGatewayFactory.maybeFromEnv] returns `null`), billing is simply
-/// not configured: one info line is logged and nothing is wired.
-///
-/// The route must be added before [Serverpod.start] (the web server binds
-/// routes at start). The reconciler runs on its own [Timer.periodic] — not a
-/// Serverpod future call — because the job lives in the commercial module's
-/// `src/` and is not registered in the OSS generated future-call protocol;
-/// the timer is cancelled via the experimental shutdown-task hook.
-Future<void> _wirePayPalBilling(Serverpod pod) async {
-  if (!commercialEntitlementsEnabled()) return;
-
-  final gateway = PayPalGatewayFactory.maybeFromEnv();
-  if (gateway == null) {
-    await pod.withSession(
-      (session) async => session.log('PayPal billing not configured'),
-    );
-    return;
-  }
-
-  if (pod.config.webServer == null) {
-    // Without a `web` section in the runtime config the Relic web server is
-    // never created and `pod.webServer` would throw; PayPal can then not
-    // reach this server at all, so surface the misconfiguration instead of
-    // crashing startup. The reconciler below still runs as the safety net.
-    await pod.withSession(
-      (session) async => session.log(
-        'PayPal gateway configured but the web server is disabled: the '
-        'webhook route is not mounted. Add a `web` section to the runtime '
-        'config to receive PayPal webhooks; the reconciliation sweep still '
-        'runs as a safety net.',
-        level: LogLevel.warning,
-      ),
-    );
-  } else {
-    pod.webServer.addRoute(
-      PayPalWebhookRouteHandler(gatewayFactory: () => gateway),
-      '/commercial/paypal/webhook',
-    );
-  }
-
-  final reconciler = Timer.periodic(_paypalReconciliationInterval, (_) {
-    unawaited(_runPayPalReconciliation(pod, gateway));
-  });
-  pod.experimental.shutdownTasks.addTask(
-    'paypal-reconciliation-timer',
-    () async => reconciler.cancel(),
-  );
-}
-
-/// Runs one [reconcileStalePendingSubscriptions] sweep on a fresh internal
-/// session (created and closed per run via [Serverpod.withSession], the
-/// Serverpod 4 idiom for database work outside a request).
-Future<void> _runPayPalReconciliation(
-  Serverpod pod,
-  PaymentGateway gateway,
-) async {
-  try {
-    await pod.withSession((session) async {
-      final report = await reconcileStalePendingSubscriptions(
-        session,
-        gateway,
-      );
-      session.log('PayPal reconciliation finished: $report');
-    });
-  } catch (error, stackTrace) {
-    // `withSession` itself failed (e.g. the database is unreachable) — there
-    // is no session to log through, so fall back to stderr. The next hourly
-    // tick retries.
-    stderr.writeln('PayPal reconciliation run failed: $error');
-    stderr.writeln(stackTrace);
-  }
 }

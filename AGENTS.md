@@ -119,6 +119,13 @@ prefixed `commercial_*` and migrate together with the server
 (`SERVERPOD_APPLY_MIGRATIONS=true`). When endpoints or models of the module
 change, mirror the public API surface into `gewerber-backend-stubs`.
 
+Commercial billing wiring (PayPal webhook route, hourly reconciliation sweep)
+lives inside the module behind its public entrypoint
+`wireCommercialBilling(Serverpod)` (exported from the module barrel; the OSS
+stubs ship an identical no-op). The host `server.dart` calls it unconditionally
+before `pod.start()` — it self-gates on `GEWERBER_COMMERCIAL_ENTITLEMENTS=true`
+and imports only the module's public barrel, no `src/` paths.
+
 ## Phases
 
 | Phase | Content | Status |
